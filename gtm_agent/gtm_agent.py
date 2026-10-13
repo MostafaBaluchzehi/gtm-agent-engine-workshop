@@ -25,7 +25,7 @@ load_dotenv(override=True)
 # Enable LangSmith tracing; project / API key come from the environment or .env.
 os.environ.setdefault("LANGSMITH_TRACING", "true")
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from langchain.tools import tool, ToolRuntime
 from langchain_openai import ChatOpenAI
 from deepagents import create_deep_agent
@@ -68,38 +68,51 @@ def build_prospect_profile(prospect_id: str) -> dict:
 
 
 SCORING_PROMPT = (
-    "You are a GTM assistant. Score the prospect's potential for the offering from "
-    "1 to 100 based on how good a fit they are, weighing their annual revenue and "
-    "tech stack. In your justification, explicitly list which of the offering's required "
-    "technologies the prospect has and which required technologies they are missing, naming "
-    "each one. Any missing required technology must lower the tech_stack_match component and "
-    "the overall score. Return a score and a justification that reflects your "
-    "overall assessment of this prospect's potential."
+    "You are a GTM assistant. Assess how well the prospect fits the offering's target segment "
+    "and provide a segment_fit from 1 to 100. In your justification, explicitly list which "
+    "of the offering's required technologies the prospect has and which they are missing, "
+    "naming each one. Return only segment_fit and a justification that reflects your "
+    "assessment of this prospect's potential."
 )
 
-from typing import Literal
+SCORING_WEIGHTS = {"revenue_fit": 0.3, "tech_stack_match": 0.4, "segment_fit": 0.3}
 
-class RubricBreakdown(BaseModel):
-    revenue_fit: float
-    tech_stack_match: float
-    segment_fit: float
-    component_max: Literal[100] = 100
-
-
-class ProspectScore(BaseModel):
-    score: float
-    max_score: int = 100
+class ProspectAssessment(BaseModel):
     justification: str
-    rubric_breakdown: RubricBreakdown
+    segment_fit: float = Field(ge=1, le=100)
 
 
-_scoring_llm = ChatOpenAI(model=MODEL_NAME, temperature=0).with_structured_output(ProspectScore)
+_scoring_llm = ChatOpenAI(model=MODEL_NAME, temperature=0).with_structured_output(ProspectAssessment)
 
 
 def _offering_has_required_fields(offering):
     "Return True if the offering has the fields needed to score against it."
-    return bool(offering) and bool(offering.get("required_tech_stack")) and \
-        offering.get("min_annual_revenue") is not None and bool(offering.get("description"))
+    return bool(offering) and bool(offering.get("description"))
+
+
+def _calculate_rubric(prospect_profile, offering):
+    "Calculate fits; empty tech requirements or no positive revenue threshold score 100."
+    required_technologies = set(offering.get("required_tech_stack") or [])
+    prospect_technologies = set(prospect_profile.get("tech_stack") or [])
+    tech_stack_match = (
+        100 * len(required_technologies & prospect_technologies) / len(required_technologies)
+        if required_technologies else 100
+    )
+
+    try:
+        revenue_threshold = float(offering.get("min_annual_revenue"))
+    except (TypeError, ValueError):
+        revenue_threshold = 0
+    if revenue_threshold <= 0:
+        revenue_fit = 100
+    else:
+        try:
+            annual_revenue = float(prospect_profile.get("annual_revenue"))
+        except (TypeError, ValueError):
+            annual_revenue = 0
+        revenue_fit = min(100, max(0, 100 * annual_revenue / revenue_threshold))
+
+    return revenue_fit, tech_stack_match
 
 
 @tool
@@ -119,7 +132,23 @@ def score_prospect(prospect_profile: dict, offering: dict | None = None) -> dict
         {"role": "system", "content": SCORING_PROMPT},
         {"role": "user", "content": user},
     ])
-    return result.model_dump()
+    revenue_fit, tech_stack_match = _calculate_rubric(prospect_profile, offering)
+    rubric_breakdown = {
+        "revenue_fit": revenue_fit,
+        "tech_stack_match": tech_stack_match,
+        "segment_fit": result.segment_fit,
+        "component_max": 100,
+    }
+    score = sum(
+        rubric_breakdown[component] * weight
+        for component, weight in SCORING_WEIGHTS.items()
+    )
+    return {
+        "score": score,
+        "max_score": 100,
+        "justification": result.justification,
+        "rubric_breakdown": rubric_breakdown,
+    }
 
 
 @tool
